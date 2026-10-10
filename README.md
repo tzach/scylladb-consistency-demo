@@ -7,6 +7,8 @@ Two protocols are available:
 - **LWT (Paxos)**: statements with an `IF` clause. Prepare (with the read in the same round), IF check, Accept, Learn, and reply. `SERIAL` reads use the same Prepare round.
 - **Raft (strongly consistent tables)**: tables in a keyspace with `consistency = 'global'` (experimental). The leader appends the entry, sends AppendEntries, commits on a majority, and replies. A follower forwards a request to the leader. A read uses a read barrier on the leader.
 
+**Live demo:** https://tzach.github.io/scylladb-consistency-demo/
+
 **Disclaimer:** An independent, educational simulator. It is not an official ScyllaDB product, and it is not 100% accurate to real ScyllaDB internals. Not affiliated with or endorsed by ScyllaDB, Inc.
 
 ![LWT: the coordinator stops after Accept, and a SERIAL read completes the write](docs/lwt-coordinator-stops.png)
@@ -34,7 +36,9 @@ Two protocols are available:
 
 ## Run it
 
-This is a static, dependency-free HTML file. Clone the repo and open `index.html` in a browser. No build step and no server are necessary.
+Open the live demo: https://tzach.github.io/scylladb-consistency-demo/
+
+Or run it locally. This is a static, dependency-free HTML file. Clone the repo and open `index.html` in a browser. No build step and no server are necessary.
 
 ```bash
 git clone https://github.com/tzach/scylladb-consistency-demo.git
