@@ -254,6 +254,7 @@
   .drop-x { stroke: var(--danger); stroke-width: 2.4; stroke-linecap: round; }
 
   .arrow-req { fill: var(--accent); } .arrow-resp { fill: var(--ok); } .arrow-client { fill: var(--client); }
+  body:not([data-mode="raft"]) #btnHeartbeat { display: none; }
   .arrow-vote { fill: var(--warn); } .arrow-err { fill: var(--danger); } .arrow-hb { fill: var(--text-faint); }
 
   .note rect { stroke-width: 1; rx: 4; }
@@ -316,6 +317,7 @@
       <div class="btn-row">
         <button type="button" class="btn btn--sm btn--primary" id="btnWrite" title="Send a write (key W)">Write</button>
         <button type="button" class="btn btn--sm btn--secondary" id="btnRead" title="Send a read (key R)">Read</button>
+        <button type="button" class="btn btn--sm btn--secondary" id="btnHeartbeat" title="The leader sends one heartbeat round (key H)">Heartbeat</button>
       </div>
     </div>
 
@@ -440,6 +442,7 @@
   const CLIENT_TIMEOUT = 9000;
   const LWT_PHASE_TIMEOUT = 2600;
   const RAFT_OP_TIMEOUT = 4200;
+  const HEARTBEAT_MS = 900;         // Raft heartbeat after a commit (not drawn)
   const ELECTION_MIN = 1500, ELECTION_JITTER = 2500, ELECTION_SPREAD = 1000;
   const SPEEDS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3];
 
@@ -778,6 +781,10 @@
     } else if (r.applied === false) {
       note("C", `${op.id} applied=false v=${r.value}`, "warn", opStatsShort(op));
       log("RESULT", `${op.id}: [applied] = false. Condition is false. Current v = ${r.value}`, "warn", opStats(op));
+    } else if (r.committed) {
+      // Raft: the leader replies when the entry is committed. The followers can apply it later.
+      note("C", `✓ ${op.id} committed`, "ok", opStatsShort(op));
+      log("RESULT", `${op.id}: write is committed (v = ${op.value}).`, "success", opStats(op));
     } else {
       note("C", `✓ ${op.id} applied`, "ok", opStatsShort(op));
       log("RESULT", `${op.id}: write is applied (v = ${op.value}).`, "success", opStats(op));
@@ -1008,8 +1015,9 @@
 
   // ======================================================================
   // Raft (strongly consistent tables, docs/dev/strong_consistency.md):
-  //   leader appends to commitlog (fsync) -> AppendEntries -> majority -> commit -> apply -> reply.
-  //   Followers forward requests to the leader. Reads use a read barrier on the leader.
+  //   leader appends to commitlog (fsync) -> AppendEntries -> majority AppendReply -> commit -> reply.
+  //   Followers forward requests to the leader. A read on the leader uses only its local state.
+  //   Periodic heartbeats are not drawn. They only tell the followers the new commit index.
   // ======================================================================
   const RAFT = {
     name: "raft",
@@ -1020,8 +1028,8 @@
         commit: 1, applied: 1, v: 0,
         role: n.id === "N1" ? "leader" : "follower",
         leader: "N1",
-        next: {}, match: {}, votes: new Set(), seq: 0,
-        pendingWrites: [], pendingReads: [], electionTimer: null,
+        next: {}, match: {}, votes: new Set(),
+        pendingWrites: [], pendingReads: [], electionTimer: null, hbTimer: null,
       };
       if (n.id === "N1") for (const f of NODE_IDS) { n.r.next[f] = 2; n.r.match[f] = 1; }
     },
@@ -1033,7 +1041,7 @@
       const wasLeader = n.r.role === "leader";
       // Volatile state is lost. term, vote, log and commit index are on disk.
       n.r.role = "follower"; n.r.leader = null; n.r.votes = new Set();
-      n.r.pendingWrites = []; n.r.pendingReads = []; n.r.electionTimer = null;
+      n.r.pendingWrites = []; n.r.pendingReads = []; n.r.electionTimer = null; n.r.hbTimer = null;
       if (wasLeader) {
         log("RAFT", `Leader ${n.id} stops. The followers start an election after a timeout.`, "warn");
         for (const id of upNodes()) this.armElection(node(id));
@@ -1096,7 +1104,7 @@
       // A new leader commits an entry of its own term before it serves reads.
       n.r.log.push({ term: n.r.term, value: null, op: "no-op" });
       n.r.match[n.id] = this.lastIdx(n);
-      this.broadcastAppend(n, true);
+      this.broadcastAppend(n);
       emit("leader", n);
     },
 
@@ -1162,28 +1170,28 @@
           note(n.id, `${op.id}: no majority in time`, "fail");
           this.replyClient(n, replyTo, { op: op.id, ok: false, err: "WriteTimeout (may commit later)" });
         });
-        this.broadcastAppend(n, false);
+        this.broadcastAppend(n);
       } else {
-        n.r.seq++;
-        const rd = { op: op.id, readIndex: n.r.commit, seq: n.r.seq, acks: new Set([n.id]), replyTo };
+        // The usual read path: the leader replies from its local state, with no messages to the followers.
+        // A new leader must first commit an entry of its own term (the no-op), so that it knows the newest commit.
+        const rd = { op: op.id, replyTo };
         n.r.pendingReads.push(rd);
-        note(n.id, `${op.id}: read barrier (index #${rd.readIndex})`, "info");
+        if (this.ownTermCommitted(n)) return this.checkReads(n);
+        note(n.id, `${op.id}: wait for the no-op to commit`, "info");
         rd.timer = nodeTimer(n, RAFT_OP_TIMEOUT, () => {
           const i = n.r.pendingReads.indexOf(rd);
           if (i < 0) return;
           n.r.pendingReads.splice(i, 1);
           this.replyClient(n, replyTo, { op: op.id, ok: false, err: "ReadTimeout: no quorum" });
         });
-        this.broadcastAppend(n, false, true);
       }
     },
 
-    broadcastAppend(n, newSeq, readBarrier) {
-      if (newSeq) n.r.seq++;
-      for (const f of NODE_IDS) if (f !== n.id) this.sendAppend(n, f, readBarrier);
+    broadcastAppend(n) {
+      for (const f of NODE_IDS) if (f !== n.id) this.sendAppend(n, f);
     },
 
-    sendAppend(n, f, readBarrier) {
+    sendAppend(n, f) {
       const r = n.r;
       const next = Math.max(1, Math.min(r.next[f] || 1, this.lastIdx(n) + 1));
       const prevIdx = next - 1;
@@ -1198,16 +1206,16 @@
         label = `AppendEntries t${r.term} ${a === b ? "#" + a : "#" + a + "-" + b} ${vals}`;
         if (label.length > 46) label = `AppendEntries t${r.term} #${a}-${b}`;
       } else {
-        label = readBarrier ? `Heartbeat t${r.term} (read barrier)` : `Heartbeat t${r.term} commit=#${r.commit}`;
+        label = `Heartbeat t${r.term} commit=#${r.commit}`;
         cls = "hb";
       }
-      send(n.id, f, "ae", { term: r.term, prevIdx, prevTerm, entries, commit: r.commit, seq: r.seq }, label, cls);
+      send(n.id, f, "ae", { term: r.term, prevIdx, prevTerm, entries, commit: r.commit }, label, cls);
     },
 
     onAppend(n, from, d) {
       const r = n.r;
       if (d.term < r.term) {
-        return send(n.id, from, "ae-resp", { term: r.term, ok: false, stale: true, seq: d.seq }, `Reject: term t${r.term}`, "err");
+        return send(n.id, from, "ae-resp", { term: r.term, ok: false, stale: true }, `AppendReply ✗ term t${r.term}`, "err");
       }
       if (r.role !== "follower") { r.role = "follower"; r.votes = new Set(); }
       if (r.leader !== from) { r.leader = from; }
@@ -1216,7 +1224,7 @@
       if (d.prevIdx > r.log.length || (d.prevIdx > 0 && r.log[d.prevIdx - 1].term !== d.prevTerm)) {
         const have = Math.min(r.log.length, d.prevIdx - 1);
         note(n.id, `log gap at #${d.prevIdx}: ask from #${have + 1}`, "warn");
-        return send(n.id, from, "ae-resp", { term: r.term, ok: false, lastIdx: have, seq: d.seq }, `Reject: need #${have + 1}`, "err");
+        return send(n.id, from, "ae-resp", { term: r.term, ok: false, lastIdx: have }, `AppendReply ✗ need #${have + 1}`, "err");
       }
       let changed = 0;
       d.entries.forEach((e, i) => {
@@ -1235,8 +1243,8 @@
         r.commit = Math.min(d.commit, Math.max(matchIdx, r.commit));
         this.apply(n);
       }
-      send(n.id, from, "ae-resp", { term: r.term, ok: true, match: matchIdx, seq: d.seq },
-        d.entries.length ? `Ack #${matchIdx}` : `Ack`, d.entries.length ? "resp" : "hb");
+      send(n.id, from, "ae-resp", { term: r.term, ok: true, match: matchIdx },
+        `AppendReply #${matchIdx}`, d.entries.length ? "resp" : "hb");
     },
 
     onAppendResp(n, from, d) {
@@ -1245,13 +1253,11 @@
       if (!d.ok) {
         if (d.stale) return;
         r.next[from] = d.lastIdx + 1;
-        return this.sendAppend(n, from, false);
+        return this.sendAppend(n, from);
       }
       r.match[from] = Math.max(r.match[from] || 0, d.match);
       if ((r.next[from] || 0) <= r.match[from]) r.next[from] = r.match[from] + 1;
-      for (const rd of r.pendingReads) if (d.seq >= rd.seq) rd.acks.add(from);
       this.advanceCommit(n);
-      this.checkReads(n);
     },
 
     advanceCommit(n) {
@@ -1271,20 +1277,53 @@
       r.pendingWrites = r.pendingWrites.filter((w) => w.idx > r.commit);
       for (const w of done) {
         cancelNodeTimer(n, w.timer);
-        this.replyClient(n, w.replyTo, { op: w.op, ok: true, applied: true, value: w.value });
+        this.replyClient(n, w.replyTo, { op: w.op, ok: true, committed: true, value: w.value });
       }
-      // Tell the followers the new commit index, so they apply the entries.
-      this.broadcastAppend(n, false);
+      this.checkReads(n);
+      this.scheduleHeartbeat(n);
+    },
+
+    // A periodic heartbeat (not drawn, not counted) tells the followers the new commit index.
+    // A follower gets the commit index only up to the entries that it has.
+    scheduleHeartbeat(n) {
+      if (n.r.hbTimer) return;
+      n.r.hbTimer = nodeTimer(n, HEARTBEAT_MS, () => {
+        n.r.hbTimer = null;
+        if (n.r.role !== "leader") return;
+        for (const f of NODE_IDS) {
+          const fn = node(f);
+          if (f === n.id || !fn.up || fn.r.term !== n.r.term) continue;
+          const c = Math.min(n.r.commit, n.r.match[f] || 0);
+          if (c > fn.r.commit) { fn.r.commit = c; this.apply(fn); }
+        }
+        S.dirty = true;
+      });
+    },
+
+    // A heartbeat round that the user starts: an AppendEntries to each follower, with the commit index
+    // and the entries that the follower does not have.
+    heartbeat() {
+      const L = this.liveLeader();
+      if (!L) return log("RAFT", "No leader at this time: no heartbeat.", "warn");
+      wakeClock();
+      note(L.id, `heartbeat t${L.r.term}`, "info");
+      log("RAFT", `${L.id} sends a heartbeat to the followers (commit = #${L.r.commit}).`, "info");
+      this.broadcastAppend(L);
+    },
+
+    ownTermCommitted(n) {
+      const r = n.r;
+      return !!r.log[r.commit - 1] && r.log[r.commit - 1].term === r.term;
     },
 
     checkReads(n) {
       const r = n.r;
-      const ownTermCommitted = r.log[r.commit - 1] && r.log[r.commit - 1].term === r.term;
-      const ready = r.pendingReads.filter((rd) => rd.acks.size >= QUORUM && ownTermCommitted && r.applied >= rd.readIndex);
-      r.pendingReads = r.pendingReads.filter((rd) => !ready.includes(rd));
+      if (!r.pendingReads.length || !this.ownTermCommitted(n)) return;
+      const ready = r.pendingReads;
+      r.pendingReads = [];
       for (const rd of ready) {
         cancelNodeTimer(n, rd.timer);
-        note(n.id, `${rd.op}: still leader: read v=${r.v}`, "ok");
+        note(n.id, `${rd.op}: local read v=${r.v}`, "ok");
         this.replyClient(n, rd.replyTo, { op: rd.op, ok: true, value: r.v });
       }
     },
@@ -1348,7 +1387,7 @@
       let lastTxt = "—";
       if (last) {
         const r = last.res;
-        lastTxt = !r.ok ? `${last.id} ✗ ${r.err}` : last.kind === "read" ? `${last.id} v=${r.value}` : `${last.id} applied=${r.applied}`;
+        lastTxt = !r.ok ? `${last.id} ✗ ${r.err}` : last.kind === "read" ? `${last.id} v=${r.value}` : r.committed ? `${last.id} committed` : `${last.id} applied=${r.applied}`;
       }
       if (lastTxt.length > 30) lastTxt = lastTxt.slice(0, 29) + "…";
       gx.append(el("text", { class: "h-line", x: x - 92, y: 108 }, `last: ${lastTxt}`));
@@ -1542,7 +1581,7 @@
   function renderBanner() {
     const steps = S.mode === "lwt"
       ? ["Prepare + read", "IF check", "Accept", "Learn", "Reply"]
-      : ["Leader append (fsync)", "AppendEntries", "Majority ack", "Commit + apply", "Reply"];
+      : ["Leader append (fsync)", "AppendEntries", "Majority AppendReply", "Commit", "Reply"];
     $("modeBanner").innerHTML =
       `<span class="mode-title">${S.mode === "lwt" ? "LWT · Paxos" : "Raft · strongly consistent table"}</span>` +
       `<span class="mode-flow">${steps.map((t) => `<span class="mode-step">${t}</span>`).join('<span class="mode-arrow">→</span>')}</span>`;
@@ -1568,11 +1607,13 @@
                 <p>A keyspace with <code>consistency = 'global'</code> (experimental) has one Raft group for each tablet. One replica is the <b>leader</b>.</p>
         <ol>
           <li>The leader writes the entry to the commitlog (fsync) and sends <b>AppendEntries</b> to the followers.</li>
-          <li>Each follower writes the entry to its commitlog and replies.</li>
-          <li>When a majority has the entry, the leader <b>commits</b> it, applies it to the memtable, and replies to the client. The next AppendEntries tells the followers the new commit index.</li>
+          <li>Each follower writes the entry to its commitlog and sends <b>AppendReply</b>.</li>
+          <li>When a majority has the entry, the leader <b>commits</b> it and replies to the client. The reply means that the entry is committed. A replica applies the entry later. The next AppendEntries or heartbeat tells the followers the new commit index.</li>
         </ol>
-        <p>A follower that gets a request <b>forwards</b> it to the leader. The reply tells the driver the leader, so the next request goes to the leader directly.</p>
-        <p>A read goes to the leader. The leader first confirms that it is still the leader (<b>read barrier</b>), then it reads.</p>
+        <p>A usual write uses 6 messages: the client request and reply (2), AppendEntries (2) and AppendReply (2). If the client sends the write to a follower, the follower <b>forwards</b> it to the leader (+2 messages). The reply tells the driver the leader, so the next request goes to the leader directly.</p>
+        <p>A read goes to the leader. Usually, the leader replies from its local state, with no messages to the followers (2 messages in total). In rare cases, the leader first does a <b>read barrier</b> (not shown).</p>
+        <p>Periodic heartbeats are not shown. They do not occur once for each request. Click <b>Heartbeat</b> (key <code>H</code>) to see one heartbeat round: the leader sends the commit index and the missing entries to the followers.</p>
+        <p>Strongly consistent tables do not support LWT (<code>IF</code> conditions) at this time. Thus, the Raft writes in this demo have no <code>IF</code> clause.</p>
         <p style="margin:0;">If the leader stops, a follower starts an <b>election</b> after a timeout. A node votes only for a candidate with a log that is as new as its log. Thus, a committed entry is never lost.</p>`;
     }
   }
@@ -1633,9 +1674,9 @@
         } },
     ],
     raft: [
-      { name: "Write, then read", desc: "The client sends a write to leader N1. N1 replicates the entry. With a majority, it commits and replies. Then a read uses a read barrier on the leader.",
+      { name: "Write, then read", desc: "The client sends a write to leader N1. N1 replicates the entry. With a majority of AppendReply messages, it commits and replies (6 messages). Then the leader replies to a read from its local state (2 messages).",
         run: async (a) => { await a.write("N1", 5); await a.wait(400); await a.read("N1"); } },
-      { name: "Write to a follower (forward)", desc: "The client sends the write to N2, which is a follower. N2 forwards it to leader N1. The reply tells the driver the leader. The next write (auto) goes to N1 directly.",
+      { name: "Write to a follower (forward)", desc: "The client sends the write to N2, which is a follower. N2 forwards it to leader N1 (+2 messages, 8 in total). The reply tells the driver the leader. The next write (auto) goes to N1 directly.",
         run: async (a) => { await a.write("N2", 6); await a.wait(400); await a.write(undefined, 7); } },
       { name: "A follower stops", desc: "N3 stops. N1 and N2 are a majority, so writes commit. When N3 starts again, the leader sends the missing entries (catch-up).",
         run: async (a) => {
@@ -1716,9 +1757,11 @@
   // ======================================================================
   function doWrite() { clientOp("write", { value: +$("valueInput").value }); }
   function doRead() { clientOp("read"); }
+  function doHeartbeat() { if (S.mode === "raft") RAFT.heartbeat(); }
 
   $("btnWrite").addEventListener("click", doWrite);
   $("btnRead").addEventListener("click", doRead);
+  $("btnHeartbeat").addEventListener("click", doHeartbeat);
   $("btnPause").addEventListener("click", () => setPaused(!S.paused));
   $("btnStep").addEventListener("click", stepOrStart);
   $("btnReset").addEventListener("click", () => { reset(); log("RESET", "The simulation starts again.", "info"); });
@@ -1739,6 +1782,7 @@
     if (k === "1" || k === "2" || k === "3") toggleNode("N" + k);
     else if (k === "w") doWrite();
     else if (k === "r") doRead();
+    else if (k === "h") doHeartbeat();
     else if (k === "n") stepOrStart();
     else if (k === " ") { e.preventDefault(); setPaused(!S.paused); }
     else return;
