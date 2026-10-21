@@ -5,7 +5,7 @@ An interactive, single-file simulator that shows ScyllaDB strong consistency as 
 Two protocols are available:
 
 - **LWT (Paxos)**: statements with an `IF` clause. Prepare (with the read in the same round), IF check, Accept, Learn, and reply. `SERIAL` reads use the same Prepare round.
-- **Raft (strongly consistent tables)**: tables in a keyspace with `consistency = 'global'` (experimental). The leader appends the entry, sends AppendEntries, commits on a majority, and replies. A follower forwards a request to the leader. A read uses a read barrier on the leader.
+- **Raft (strongly consistent tables)**: tables in a keyspace with `consistency = 'global'` (experimental). The leader appends the entry, sends AppendEntries, commits on a majority of AppendReply messages, and replies. A usual write uses 6 messages. A follower forwards a request to the leader (+2 messages). A read on the leader uses only its local state (2 messages). Strongly consistent tables do not support LWT (`IF` conditions) at this time.
 
 **Live demo:** https://tzach.github.io/scylladb-consistency-demo/
 
@@ -27,6 +27,7 @@ Two protocols are available:
   - Raft: role, term, vote, log entries (committed or not), commit index.
 - Stop or start a node at any time: click its card, or press `1`, `2` or `3`. A message to a stopped node is lost (✕). A stopped node keeps its disk state.
 - Send a write or a read from the client (`W` and `R` keys). Send it to a specific node, or let the driver select the node.
+- Raft: click Heartbeat (`H` key) to make the leader send one heartbeat round to the followers. It carries the commit index and the missing entries.
 - Pause, Step (`N`), speed control, and "Pause on each message" to stop a node at an exact point in the protocol.
 - 14 preset scenarios. Examples:
   - LWT: the coordinator stops after Accept, or after Prepare. Two clients race with `IF v = 0`. No quorum.
@@ -59,5 +60,7 @@ The protocol behavior follows these documents in the ScyllaDB source tree:
 ## Simplifications
 
 - Network latency is simulated (480–780 ms for each hop), so the latencies show relative cost, not real values.
-- Paxos prune and periodic Raft heartbeats are not drawn. A follower detects a stopped leader after a random election timeout.
+- Paxos prune and periodic Raft heartbeats are not drawn. A heartbeat tells the followers the new commit index. A follower detects a stopped leader after a random election timeout.
+- The Raft read barrier is not shown. It occurs only in rare cases. Usually, the leader replies to a read from its local state.
+- A write coordinator that forwards to a stale leader (+2 messages) is not shown.
 - One partition, one tablet, one Raft group, RF=3.
